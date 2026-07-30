@@ -135,6 +135,8 @@ Docker CPU percentage uses `100%` per logical CPU. A container using two complet
 
 The script detects explicit limits configured through NanoCPUs, CPU quota/period, or CPU-set restrictions. Containers without an explicit limit display `uncapped`.
 
+CPU-set restrictions are shared scheduling capacity, not a separate allocation for every container. A container restricted to CPU IDs `0-5` displays `6 cores`. If several containers in one stack use that same set, the stack counts the union of CPU IDs once and displays `6 shared` rather than adding the limit once per container. Partially overlapping CPU sets are also deduplicated by CPU ID. NanoCPU and CPU quota/period limits remain additive because those limits are assigned independently to each container.
+
 ### Memory
 
 Memory is displayed as current usage followed by the configured container limit:

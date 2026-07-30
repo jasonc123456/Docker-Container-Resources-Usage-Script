@@ -116,6 +116,33 @@ human_pct() {
     printf '%d.%02d%%' "$((value / 100))" "$((value % 100))"
 }
 
+cpuset_union_hundredths() {
+    awk -v sets="${1:-}" 'BEGIN {
+        count = 0
+        group_count = split(sets, groups, ";")
+        for (g = 1; g <= group_count; g++) {
+            entry_count = split(groups[g], entries, ",")
+            for (i = 1; i <= entry_count; i++) {
+                entry = entries[i]
+                gsub(/[[:space:]]/, "", entry)
+                if (entry ~ /^[0-9]+-[0-9]+$/) {
+                    split(entry, range, "-")
+                    first = range[1] + 0
+                    last = range[2] + 0
+                    if (last < first) { swap = first; first = last; last = swap }
+                    for (cpu = first; cpu <= last; cpu++) {
+                        if (!(cpu in seen)) { seen[cpu] = 1; count++ }
+                    }
+                } else if (entry ~ /^[0-9]+$/) {
+                    cpu = entry + 0
+                    if (!(cpu in seen)) { seen[cpu] = 1; count++ }
+                }
+            }
+        }
+        printf "%d\n", count * 10000
+    }'
+}
+
 cpu_limit_hundredths() {
     local nano=$1 quota=$2 period=$3 cpuset=$4
     if [[ "$nano" =~ ^[0-9]+$ ]] && ((nano > 0)); then
@@ -124,25 +151,42 @@ cpu_limit_hundredths() {
          ((quota > 0 && period > 0)); then
         printf '%d\n' "$((quota * 10000 / period))"
     elif [[ -n "$cpuset" && "$cpuset" != '<no value>' ]]; then
-        awk -v set="$cpuset" 'BEGIN {
-            count = 0
-            n = split(set, entries, ",")
-            for (i = 1; i <= n; i++) {
-                if (entries[i] ~ /-/) {
-                    split(entries[i], range, "-")
-                    count += range[2] - range[1] + 1
-                } else if (entries[i] != "") count++
-            }
-            printf "%d\n", count * 10000
-        }'
+        cpuset_union_hundredths "$cpuset"
     else
         printf '0\n'
     fi
 }
 
+cpu_limit_kind() {
+    local nano=$1 quota=$2 period=$3 cpuset=$4
+    if [[ "$nano" =~ ^[0-9]+$ ]] && ((nano > 0)); then
+        printf 'quota'
+    elif [[ "$quota" =~ ^-?[0-9]+$ && "$period" =~ ^[0-9]+$ ]] &&
+         ((quota > 0 && period > 0)); then
+        printf 'quota'
+    elif [[ -n "$cpuset" && "$cpuset" != '<no value>' ]]; then
+        printf 'cpuset'
+    else
+        printf 'none'
+    fi
+}
+
 cpu_text() {
+    local mode=${3:-percent} cores noun
     if (($2 > 0)); then
-        printf '%s / %s' "$(human_pct "$1")" "$(human_pct "$2")"
+        case "$mode" in
+            cpuset)
+                cores=$(($2 / 10000))
+                if ((cores == 1)); then noun=core; else noun=cores; fi
+                printf '%s / %d %s' "$(human_pct "$1")" "$cores" "$noun"
+                ;;
+            shared)
+                printf '%s / %d shared' "$(human_pct "$1")" "$(($2 / 10000))"
+                ;;
+            *)
+                printf '%s / %s' "$(human_pct "$1")" "$(human_pct "$2")"
+                ;;
+        esac
     else
         printf '%s / uncapped' "$(human_pct "$1")"
     fi
@@ -223,6 +267,7 @@ HOST_CAPACITY_TEXT="RAM: $(human_bytes "$RAM_TOTAL_BYTES") total | Root disk: $(
 declare -a META=() STACKS=()
 declare -A STAT_CPU=() STAT_MEM=() COLLAPSED=()
 declare -A GROUP_COUNT=() GROUP_CPU=() GROUP_CPU_LIMIT=() GROUP_CPU_UNCAPPED=()
+declare -A GROUP_CPU_MODE=()
 declare -A GROUP_MEM=() GROUP_MEM_LIMIT=() GROUP_MEM_UNCAPPED=()
 declare -A GROUP_STORAGE=() GROUP_STORAGE_UNKNOWN=()
 declare -A ROW_TO_STACK=()
@@ -241,6 +286,7 @@ clear_snapshot_data() {
     META=() STACKS=()
     STAT_CPU=() STAT_MEM=()
     GROUP_COUNT=() GROUP_CPU=() GROUP_CPU_LIMIT=() GROUP_CPU_UNCAPPED=()
+    GROUP_CPU_MODE=()
     GROUP_MEM=() GROUP_MEM_LIMIT=() GROUP_MEM_UNCAPPED=()
     GROUP_STORAGE=() GROUP_STORAGE_UNKNOWN=()
     TOTAL_CPU=0 TOTAL_CPU_LIMIT=0 TOTAL_CPU_UNCAPPED=0
@@ -374,8 +420,9 @@ collect_snapshot() {
     local -A next_cpu=() next_mem=()
     local ps_output stats_output inspect_output
     local name cpu_raw mem_raw mem_used_raw
-    local full_id stack swarm_stack mem_limit rootfs storage nano quota period cpuset cpu_limit mounts
-    local line cpu_used mem_used mount_entry mount_key mount_size mount_known mount_unknown
+    local full_id stack swarm_stack mem_limit rootfs storage nano quota period cpuset cpu_limit cpu_kind mounts
+    local line cpu_used mem_used mount_entry mount_key mount_size mount_known mount_unknown shared_limit
+    local total_cpuset_specs=''
 
     LAST_ERROR=''
     STATUS_MESSAGE='Collecting snapshot...'
@@ -440,18 +487,20 @@ collect_snapshot() {
             [[ "$mem_limit" =~ ^[0-9]+$ ]] || mem_limit=0
             [[ "$rootfs" =~ ^[0-9]+$ ]] || rootfs=0
             cpu_limit=$(cpu_limit_hundredths "$nano" "$quota" "$period" "$cpuset")
-            printf '%s|%s|%s|%s|%s|%s|%s\n' \
-                "$stack" "$name" "$full_id" "$mem_limit" "$rootfs" "$cpu_limit" "$mounts"
+            cpu_kind=$(cpu_limit_kind "$nano" "$quota" "$period" "$cpuset")
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+                "$stack" "$name" "$full_id" "$mem_limit" "$rootfs" "$cpu_limit" \
+                "$cpu_kind" "$cpuset" "$mounts"
         done <<< "$inspect_output" | sort -t '|' -k1,1 -k2,2
     )
 
     refresh_mount_cache_if_due || return 1
     measured_meta=()
     for line in "${raw_meta[@]}"; do
-        IFS='|' read -r stack name full_id mem_limit rootfs cpu_limit mounts <<< "$line"
+        IFS='|' read -r stack name full_id mem_limit rootfs cpu_limit cpu_kind cpuset mounts <<< "$line"
         measure_container_mounts "$name" "$mounts" || return 1
         storage=$((rootfs + MEASURED_MOUNT_BYTES))
-        measured_meta+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$MEASURED_MOUNT_UNKNOWN|$rootfs|$MEASURED_MOUNT_KEYS")
+        measured_meta+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$MEASURED_MOUNT_UNKNOWN|$rootfs|$cpu_kind|$cpuset|$MEASURED_MOUNT_KEYS")
     done
 
     # Commit only after every slow command has completed. Until this point the
@@ -463,9 +512,10 @@ collect_snapshot() {
     done
 
     declare -A seen=() group_mount_seen=() total_mount_seen=()
+    declare -A group_cpuset_specs=() group_has_quota=()
     for line in "${measured_meta[@]}"; do
-        IFS='|' read -r stack name full_id mem_limit storage cpu_limit mount_unknown rootfs mounts <<< "$line"
-        META+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$mount_unknown")
+        IFS='|' read -r stack name full_id mem_limit storage cpu_limit mount_unknown rootfs cpu_kind cpuset mounts <<< "$line"
+        META+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$mount_unknown|$cpu_kind|$cpuset")
         cpu_used=${STAT_CPU["$name"]:-0}
         mem_used=${STAT_MEM["$name"]:-0}
         if [[ -z ${seen["$stack"]+x} ]]; then
@@ -497,13 +547,21 @@ collect_snapshot() {
             fi
         done
 
-        if ((cpu_limit > 0)); then
-            GROUP_CPU_LIMIT["$stack"]=$(( ${GROUP_CPU_LIMIT["$stack"]:-0} + cpu_limit ))
-            TOTAL_CPU_LIMIT=$((TOTAL_CPU_LIMIT + cpu_limit))
-        else
-            GROUP_CPU_UNCAPPED["$stack"]=1
-            TOTAL_CPU_UNCAPPED=1
-        fi
+        case "$cpu_kind" in
+            cpuset)
+                group_cpuset_specs["$stack"]+="${cpuset};"
+                total_cpuset_specs+="${cpuset};"
+                ;;
+            quota)
+                GROUP_CPU_LIMIT["$stack"]=$(( ${GROUP_CPU_LIMIT["$stack"]:-0} + cpu_limit ))
+                TOTAL_CPU_LIMIT=$((TOTAL_CPU_LIMIT + cpu_limit))
+                group_has_quota["$stack"]=1
+                ;;
+            *)
+                GROUP_CPU_UNCAPPED["$stack"]=1
+                TOTAL_CPU_UNCAPPED=1
+                ;;
+        esac
         if ((mem_limit > 0)); then
             GROUP_MEM_LIMIT["$stack"]=$(( ${GROUP_MEM_LIMIT["$stack"]:-0} + mem_limit ))
             TOTAL_MEM_LIMIT=$((TOTAL_MEM_LIMIT + mem_limit))
@@ -512,6 +570,23 @@ collect_snapshot() {
             TOTAL_MEM_UNCAPPED=1
         fi
     done
+
+    # CPU-set limits describe physical CPUs available to every container, so
+    # repeated sets are shared capacity rather than additive quotas. Count the
+    # union once per stack and once for the overall snapshot.
+    for stack in "${STACKS[@]}"; do
+        if [[ -n ${group_cpuset_specs["$stack"]:-} ]]; then
+            shared_limit=$(cpuset_union_hundredths "${group_cpuset_specs["$stack"]}")
+            GROUP_CPU_LIMIT["$stack"]=$(( ${GROUP_CPU_LIMIT["$stack"]:-0} + shared_limit ))
+            if [[ -z ${group_has_quota["$stack"]+x} ]]; then
+                GROUP_CPU_MODE["$stack"]='shared'
+            fi
+        fi
+    done
+    if [[ -n "$total_cpuset_specs" ]]; then
+        shared_limit=$(cpuset_union_hundredths "$total_cpuset_specs")
+        TOTAL_CPU_LIMIT=$((TOTAL_CPU_LIMIT + shared_limit))
+    fi
 
     ((${#STACKS[@]} == 0)) && SELECTED_INDEX=0
     ((${#STACKS[@]} > 0 && SELECTED_INDEX >= ${#STACKS[@]})) &&
@@ -558,8 +633,8 @@ print_table_row() {
 
 build_dashboard() {
     local -a row_types=() row_stacks=() row_names=()
-    local line stack name full_id mem_limit storage storage_unknown cpu_limit cpu_used mem_used
-    local cpu_limit_display mem_limit_display cpu_display mem_display
+    local line stack name full_id mem_limit storage storage_unknown cpu_limit cpu_used mem_used cpu_kind cpuset
+    local cpu_limit_display mem_limit_display cpu_display mem_display cpu_mode
     local cpu_color mem_color first label i j selected_line=0
     local viewport content_count screen_row footer overall
 
@@ -594,7 +669,7 @@ build_dashboard() {
         row_names+=('')
         if ((${COLLAPSED["$stack"]:-0} == 0)); then
             for line in "${META[@]}"; do
-                IFS='|' read -r first name full_id mem_limit storage cpu_limit storage_unknown <<< "$line"
+                IFS='|' read -r first name full_id mem_limit storage cpu_limit storage_unknown cpu_kind cpuset <<< "$line"
                 [[ "$first" == "$stack" ]] || continue
                 row_types+=(container)
                 row_stacks+=("$stack")
@@ -645,7 +720,8 @@ build_dashboard() {
                 mem_limit_display=${GROUP_MEM_LIMIT["$stack"]:-0}
                 ((${GROUP_CPU_UNCAPPED["$stack"]:-0})) && cpu_limit_display=0
                 ((${GROUP_MEM_UNCAPPED["$stack"]:-0})) && mem_limit_display=0
-                cpu_display=$(cpu_text "${GROUP_CPU["$stack"]}" "$cpu_limit_display")
+                cpu_mode=${GROUP_CPU_MODE["$stack"]:-percent}
+                cpu_display=$(cpu_text "${GROUP_CPU["$stack"]}" "$cpu_limit_display" "$cpu_mode")
                 mem_display=$(memory_text "${GROUP_MEM["$stack"]}" "$mem_limit_display")
                 cpu_color=$(resource_color "${GROUP_CPU["$stack"]}" "$cpu_limit_display")
                 mem_color=$(resource_color "${GROUP_MEM["$stack"]}" "$mem_limit_display")
@@ -659,12 +735,12 @@ build_dashboard() {
             container)
                 name=${row_names[$i]}
                 for line in "${META[@]}"; do
-                    IFS='|' read -r first stack full_id mem_limit storage cpu_limit storage_unknown <<< "$line"
+                    IFS='|' read -r first stack full_id mem_limit storage cpu_limit storage_unknown cpu_kind cpuset <<< "$line"
                     [[ "$stack" == "$name" ]] && break
                 done
                 cpu_used=${STAT_CPU["$name"]:-0}
                 mem_used=${STAT_MEM["$name"]:-0}
-                print_table_row "    $name" "$(cpu_text "$cpu_used" "$cpu_limit")" \
+                print_table_row "    $name" "$(cpu_text "$cpu_used" "$cpu_limit" "$cpu_kind")" \
                     "$(memory_text "$mem_used" "$mem_limit")" "$(storage_text "$storage" "$storage_unknown")" \
                     '' "$(resource_color "$cpu_used" "$cpu_limit")" \
                     "$(resource_color "$mem_used" "$mem_limit")" "$CYAN"
@@ -692,7 +768,8 @@ render_dashboard() {
 }
 
 render_full_report() {
-    local line stack name full_id mem_limit storage storage_unknown cpu_limit cpu_used mem_used
+    local line stack name full_id mem_limit storage storage_unknown cpu_limit cpu_used mem_used cpu_kind cpuset
+    local cpu_limit_display cpu_mode
     printf '%bDocker Resource Monitor%b | %s | snapshot %s\n' "$BOLD$CYAN" "$RESET" "$(hostname)" "$SNAPSHOT_TIME"
     printf '%s\n%s\n' "$HOST_CPU_TEXT" "$HOST_CAPACITY_TEXT"
     printf 'Running: %d | CPU: %s | RAM: %s | Container storage: %s\n\n' \
@@ -701,17 +778,21 @@ render_full_report() {
     printf '%s\n' '-----------------------------------+-----------------------+---------------------------+----------------'
     stack=''
     for line in "${META[@]}"; do
-        IFS='|' read -r full_id name _ mem_limit storage cpu_limit storage_unknown <<< "$line"
+        IFS='|' read -r full_id name _ mem_limit storage cpu_limit storage_unknown cpu_kind cpuset <<< "$line"
         if [[ "$full_id" != "$stack" ]]; then
             stack=$full_id
+            cpu_limit_display=${GROUP_CPU_LIMIT["$stack"]:-0}
+            ((${GROUP_CPU_UNCAPPED["$stack"]:-0})) && cpu_limit_display=0
+            cpu_mode=${GROUP_CPU_MODE["$stack"]:-percent}
             printf '[stack: %s] CPU %s | RAM %s | Storage %s\n' "$stack" \
-                "$(human_pct "${GROUP_CPU["$stack"]}")" "$(human_bytes "${GROUP_MEM["$stack"]}")" \
+                "$(cpu_text "${GROUP_CPU["$stack"]}" "$cpu_limit_display" "$cpu_mode")" \
+                "$(human_bytes "${GROUP_MEM["$stack"]}")" \
                 "$(storage_text "${GROUP_STORAGE["$stack"]}" "${GROUP_STORAGE_UNKNOWN["$stack"]:-0}")"
         fi
         cpu_used=${STAT_CPU["$name"]:-0}
         mem_used=${STAT_MEM["$name"]:-0}
         printf '  %-32s | %21s | %-25s | %14s\n' "$name" \
-            "$(cpu_text "$cpu_used" "$cpu_limit")" "$(memory_text "$mem_used" "$mem_limit")" \
+            "$(cpu_text "$cpu_used" "$cpu_limit" "$cpu_kind")" "$(memory_text "$mem_used" "$mem_limit")" \
             "$(storage_text "$storage" "$storage_unknown")"
     done
     printf '\n* Storage = root filesystem plus mounted local data. Shared mounts are deduplicated in stack/host totals.\n'
