@@ -1,6 +1,6 @@
 # Docker Container Resources Usage Script
 
-An interactive terminal dashboard for monitoring resources used by running Docker containers. Containers are automatically grouped by Docker Compose project or Docker Swarm stack, with totals shown for every group.
+An interactive light weight terminal dashboard for monitoring resources used by running Docker containers. Containers are automatically grouped by Docker Compose project or Docker Swarm stack, with totals shown for every group.
 
 The dashboard is designed for local terminals and SSH sessions. It uses a bounded alternate screen, responsive columns, keyboard navigation, and optional mouse controls without filling terminal scrollback on every refresh.
 
