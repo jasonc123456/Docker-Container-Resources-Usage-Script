@@ -191,7 +191,7 @@ Stack storage totals deduplicate shared local mount sources so, for example, the
 
 ## Refresh behavior
 
-The default refresh interval is five seconds. The dashboard builds each completed frame off-screen and sends it to the terminal in one update. It also uses the terminal's alternate screen, so normal shell scrollback is restored after quitting.
+The default refresh interval is five seconds. Keyboard and mouse actions are handled independently of that interval, including while the next Docker snapshot is being collected. The dashboard keeps showing the previous complete snapshot during collection, builds each changed frame off-screen, and sends it to the terminal in one update. It also uses the terminal's alternate screen, so normal shell scrollback is restored after quitting.
 
 At a one-second setting, Docker's own statistics sampling and filesystem measurement time may make the effective interval longer than exactly one second on busy hosts.
 

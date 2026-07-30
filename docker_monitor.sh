@@ -234,8 +234,51 @@ SNAPSHOT_TIME='' LAST_ERROR='' STATUS_MESSAGE='Ready'
 SELECTED_INDEX=0 SCROLL_OFFSET=0 EXIT_REQUESTED=0 ACTION_REFRESH=0 UI_DIRTY=1
 NEXT_REFRESH=0
 ORIGINAL_STTY=''
-FRAME_FILE=''
+FRAME_FILE='' CAPTURE_FILE=''
 MOUNT_SCAN_INTERVAL=30 LAST_MOUNT_SCAN=-1
+
+clear_snapshot_data() {
+    META=() STACKS=()
+    STAT_CPU=() STAT_MEM=()
+    GROUP_COUNT=() GROUP_CPU=() GROUP_CPU_LIMIT=() GROUP_CPU_UNCAPPED=()
+    GROUP_MEM=() GROUP_MEM_LIMIT=() GROUP_MEM_UNCAPPED=()
+    GROUP_STORAGE=() GROUP_STORAGE_UNKNOWN=()
+    TOTAL_CPU=0 TOTAL_CPU_LIMIT=0 TOTAL_CPU_UNCAPPED=0
+    TOTAL_MEM=0 TOTAL_MEM_LIMIT=0 TOTAL_MEM_UNCAPPED=0
+    TOTAL_STORAGE=0 TOTAL_STORAGE_UNKNOWN=0
+}
+
+# Run a potentially slow command in the background while the foreground shell
+# continues to process keyboard and mouse events. The completed command output
+# is assigned to the variable named by the first argument.
+capture_command() {
+    local output_name=$1 captured_text status pid
+    shift
+
+    if ((!INTERACTIVE)); then
+        captured_text=$("$@" 2>&1)
+        status=$?
+        printf -v "$output_name" '%s' "$captured_text"
+        return "$status"
+    fi
+
+    "$@" >"$CAPTURE_FILE" 2>&1 < /dev/null &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        service_ui 0.05
+        if ((EXIT_REQUESTED)); then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            printf -v "$output_name" ''
+            return 130
+        fi
+    done
+    wait "$pid"
+    status=$?
+    captured_text=$(<"$CAPTURE_FILE")
+    printf -v "$output_name" '%s' "$captured_text"
+    return "$status"
+}
 
 refresh_mount_cache_if_due() {
     local output volume size
@@ -243,8 +286,11 @@ refresh_mount_cache_if_due() {
         return
     fi
     MOUNT_SIZE_CACHE=() MOUNT_KNOWN_CACHE=() VOLUME_SIZE=()
-    output=$(docker system df -v \
-        --format '{{range .Volumes}}{{println .Name "|" .Size}}{{end}}' 2>/dev/null || true)
+    if ! capture_command output docker system df -v \
+        --format '{{range .Volumes}}{{println .Name "|" .Size}}{{end}}'; then
+        output=''
+    fi
+    ((EXIT_REQUESTED)) && return 1
     while IFS='|' read -r volume size; do
         volume=${volume//[[:space:]]/}
         size=${size//[[:space:]]/}
@@ -303,13 +349,14 @@ measure_container_mounts() {
             if [[ "$type" == volume && -n ${VOLUME_SIZE["$volume"]+x} ]]; then
                 size=${VOLUME_SIZE["$volume"]}
                 known=1
-            elif result=$(du -sb -- "$source" 2>/dev/null); then
+            elif capture_command result du -sb -- "$source"; then
                 size=${result%%[[:space:]]*}
                 [[ "$size" =~ ^[0-9]+$ ]] && known=1
-            elif result=$(docker exec -u 0 "$container" du -sb "$destination" 2>/dev/null); then
+            elif capture_command result docker exec -u 0 "$container" du -sb "$destination"; then
                 size=${result%%[[:space:]]*}
                 [[ "$size" =~ ^[0-9]+$ ]] && known=1
             fi
+            ((EXIT_REQUESTED)) && return 1
             [[ "$size" =~ ^[0-9]+$ ]] || size=0
             MOUNT_SIZE_CACHE["$key"]=$size
             MOUNT_KNOWN_CACHE["$key"]=$known
@@ -319,51 +366,69 @@ measure_container_mounts() {
         ((known)) || MEASURED_MOUNT_UNKNOWN=$((MEASURED_MOUNT_UNKNOWN + 1))
         MEASURED_MOUNT_KEYS+="$key~$size~$known^"
     done
+    return 0
 }
 
 collect_snapshot() {
-    local -a ids raw_meta
-    local stats_output inspect_output
+    local -a ids raw_meta measured_meta
+    local -A next_cpu=() next_mem=()
+    local ps_output stats_output inspect_output
     local name cpu_raw mem_raw mem_used_raw
     local full_id stack swarm_stack mem_limit rootfs storage nano quota period cpuset cpu_limit mounts
-    local line cpu_used mem_used mount_entry mount_key mount_size mount_known
+    local line cpu_used mem_used mount_entry mount_key mount_size mount_known mount_unknown
 
     LAST_ERROR=''
-    mapfile -t ids < <(docker ps -q)
-    META=() STACKS=()
-    STAT_CPU=() STAT_MEM=()
-    GROUP_COUNT=() GROUP_CPU=() GROUP_CPU_LIMIT=() GROUP_CPU_UNCAPPED=()
-    GROUP_MEM=() GROUP_MEM_LIMIT=() GROUP_MEM_UNCAPPED=()
-    GROUP_STORAGE=() GROUP_STORAGE_UNKNOWN=()
-    TOTAL_CPU=0 TOTAL_CPU_LIMIT=0 TOTAL_CPU_UNCAPPED=0
-    TOTAL_MEM=0 TOTAL_MEM_LIMIT=0 TOTAL_MEM_UNCAPPED=0
-    TOTAL_STORAGE=0 TOTAL_STORAGE_UNKNOWN=0
+    STATUS_MESSAGE='Collecting snapshot...'
+
+    if ! capture_command ps_output docker ps -q; then
+        ((EXIT_REQUESTED)) && return 1
+        LAST_ERROR="Docker ps failed: $ps_output"
+        STATUS_MESSAGE=$LAST_ERROR
+        UI_DIRTY=1
+        return 1
+    fi
+    while IFS= read -r full_id; do
+        [[ -n "$full_id" ]] && ids+=("$full_id")
+    done <<< "$ps_output"
 
     if ((${#ids[@]} == 0)); then
+        clear_snapshot_data
+        SELECTED_INDEX=0 SCROLL_OFFSET=0
         SNAPSHOT_TIME=$(date '+%H:%M:%S')
         STATUS_MESSAGE='No running containers'
         return 0
     fi
 
-    if ! stats_output=$(docker stats --no-stream \
-        --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}' 2>&1); then
+    if ! capture_command stats_output docker stats --no-stream \
+        --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}'; then
+        ((EXIT_REQUESTED)) && return 1
         LAST_ERROR="Docker stats failed: $stats_output"
+        STATUS_MESSAGE=$LAST_ERROR
+        UI_DIRTY=1
         return 1
     fi
 
-    inspect_output=$(docker inspect --size \
+    if ! capture_command inspect_output docker inspect --size \
         --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.stack.namespace"}}|{{.HostConfig.Memory}}|{{.SizeRootFs}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.CpuQuota}}|{{.HostConfig.CpuPeriod}}|{{.HostConfig.CpusetCpus}}|{{range .Mounts}}{{printf "%s~%s~%s~%s^" .Type (index . "Name") .Source .Destination}}{{end}}' \
-        "${ids[@]}" 2>/dev/null || true)
+        "${ids[@]}"; then
+        ((EXIT_REQUESTED)) && return 1
+        LAST_ERROR="Docker inspect failed: $inspect_output"
+        STATUS_MESSAGE=$LAST_ERROR
+        UI_DIRTY=1
+        return 1
+    fi
     if [[ -z "$inspect_output" ]]; then
         LAST_ERROR='Docker inspect returned no running containers'
+        STATUS_MESSAGE=$LAST_ERROR
+        UI_DIRTY=1
         return 1
     fi
 
     while IFS='|' read -r name cpu_raw mem_raw; do
         [[ -n "$name" ]] || continue
         mem_used_raw=${mem_raw%% / *}
-        STAT_CPU["$name"]=$(pct_to_hundredths "$cpu_raw")
-        STAT_MEM["$name"]=$(to_bytes "$mem_used_raw")
+        next_cpu["$name"]=$(pct_to_hundredths "$cpu_raw")
+        next_mem["$name"]=$(to_bytes "$mem_used_raw")
     done <<< "$stats_output"
 
     mapfile -t raw_meta < <(
@@ -380,14 +445,27 @@ collect_snapshot() {
         done <<< "$inspect_output" | sort -t '|' -k1,1 -k2,2
     )
 
-    refresh_mount_cache_if_due
-    declare -A seen=() group_mount_seen=() total_mount_seen=()
-    META=()
+    refresh_mount_cache_if_due || return 1
+    measured_meta=()
     for line in "${raw_meta[@]}"; do
         IFS='|' read -r stack name full_id mem_limit rootfs cpu_limit mounts <<< "$line"
-        measure_container_mounts "$name" "$mounts"
+        measure_container_mounts "$name" "$mounts" || return 1
         storage=$((rootfs + MEASURED_MOUNT_BYTES))
-        META+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$MEASURED_MOUNT_UNKNOWN")
+        measured_meta+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$MEASURED_MOUNT_UNKNOWN|$rootfs|$MEASURED_MOUNT_KEYS")
+    done
+
+    # Commit only after every slow command has completed. Until this point the
+    # prior snapshot remains intact and can be redrawn for any UI action.
+    clear_snapshot_data
+    for name in "${!next_cpu[@]}"; do
+        STAT_CPU["$name"]=${next_cpu["$name"]}
+        STAT_MEM["$name"]=${next_mem["$name"]}
+    done
+
+    declare -A seen=() group_mount_seen=() total_mount_seen=()
+    for line in "${measured_meta[@]}"; do
+        IFS='|' read -r stack name full_id mem_limit storage cpu_limit mount_unknown rootfs mounts <<< "$line"
+        META+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$mount_unknown")
         cpu_used=${STAT_CPU["$name"]:-0}
         mem_used=${STAT_MEM["$name"]:-0}
         if [[ -z ${seen["$stack"]+x} ]]; then
@@ -403,7 +481,7 @@ collect_snapshot() {
         TOTAL_MEM=$((TOTAL_MEM + mem_used))
         TOTAL_STORAGE=$((TOTAL_STORAGE + rootfs))
 
-        IFS='^' read -ra mount_entries <<< "$MEASURED_MOUNT_KEYS"
+        IFS='^' read -ra mount_entries <<< "$mounts"
         for mount_entry in "${mount_entries[@]}"; do
             [[ -n "$mount_entry" ]] || continue
             IFS='~' read -r mount_key mount_size mount_known <<< "$mount_entry"
@@ -728,8 +806,20 @@ handle_key() {
         -|_) set_interval "$((INTERVAL - 1))" ;;
         [1-9]) set_interval "$key" ;;
         0|d|D) set_interval "$DEFAULT_INTERVAL" ;;
-        r|R) LAST_MOUNT_SCAN=-1; ACTION_REFRESH=1; STATUS_MESSAGE='Refreshing now' ;;
+        r|R) LAST_MOUNT_SCAN=-1; ACTION_REFRESH=1; STATUS_MESSAGE='Refreshing now'; UI_DIRTY=1 ;;
     esac
+}
+
+service_ui() {
+    local timeout=${1:-0.20} key
+    ((INTERACTIVE)) || return 0
+    ((UI_DIRTY)) && render_dashboard
+    if IFS= read -rsn1 -t "$timeout" key; then
+        handle_key "$key"
+        # Redraw in the same input cycle so navigation and collapse actions do
+        # not wait for either the polling timeout or the snapshot interval.
+        ((UI_DIRTY)) && render_dashboard
+    fi
 }
 
 cleanup_terminal() {
@@ -738,6 +828,9 @@ cleanup_terminal() {
         [[ -n "$ORIGINAL_STTY" ]] && stty "$ORIGINAL_STTY" 2>/dev/null || true
         if [[ "$FRAME_FILE" == /tmp/docker-monitor-frame.* ]]; then
             rm -f -- "$FRAME_FILE"
+        fi
+        if [[ "$CAPTURE_FILE" == /tmp/docker-monitor-command.* ]]; then
+            rm -f -- "$CAPTURE_FILE"
         fi
     fi
 }
@@ -759,17 +852,21 @@ fi
 ORIGINAL_STTY=$(stty -g 2>/dev/null || true)
 stty -echo -icanon min 0 time 0 2>/dev/null || true
 FRAME_FILE=$(mktemp /tmp/docker-monitor-frame.XXXXXX)
+CAPTURE_FILE=$(mktemp /tmp/docker-monitor-command.XXXXXX)
 printf '\033[?1049h\033[?25l\033[?1000h\033[?1006h\033[H\033[2J'
 printf '%bDocker Resource Monitor%b\nCollecting the first snapshot...' "$BOLD$CYAN" "$RESET"
+UI_DIRTY=0
 
 while ((EXIT_REQUESTED == 0)); do
-    collect_snapshot || true
-    NEXT_REFRESH=$((SECONDS + INTERVAL))
     ACTION_REFRESH=0
+    collect_snapshot || true
+    ((EXIT_REQUESTED)) && break
+    NEXT_REFRESH=$((SECONDS + INTERVAL))
     UI_DIRTY=1
 
     while ((EXIT_REQUESTED == 0 && ACTION_REFRESH == 0 && SECONDS < NEXT_REFRESH)); do
-        ((UI_DIRTY)) && render_dashboard
-        if IFS= read -rsn1 -t 0.20 key; then handle_key "$key"; fi
+        service_ui 0.20
     done
 done
+
+exit 0
