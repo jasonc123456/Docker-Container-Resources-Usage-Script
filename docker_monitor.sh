@@ -683,7 +683,12 @@ render_dashboard() {
     local frame
     build_dashboard > "$FRAME_FILE"
     frame=$(<"$FRAME_FILE")
-    printf '\033[?2026h\033[H%s\033[J\033[?2026l' "$frame"
+    # A newline only moves the cursor; it does not erase text left by a taller
+    # previous frame. Clear to end-of-line before every newline (including the
+    # intentionally blank viewport rows), then clear the remainder after the
+    # footer. The whole update is still submitted as one synchronized write.
+    frame=${frame//$'\n'/$'\033[K\n'}
+    printf '\033[?2026h\033[H\033[2K%s\033[K\033[J\033[?2026l' "$frame"
 }
 
 render_full_report() {
