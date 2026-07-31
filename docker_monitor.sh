@@ -250,6 +250,20 @@ storage_text() {
     if (($2 > 0)); then printf '%s+' "$text"; else printf '%s' "$text"; fi
 }
 
+image_storage_text() {
+    local text
+    text=$(human_bytes "$1")
+    if (($2 > 0)); then printf '%s~' "$text"; else printf '%s' "$text"; fi
+}
+
+total_storage_text() {
+    local text
+    text=$(human_bytes "$1")
+    (($2 > 0)) && text+='+'
+    (($3 > 0)) && text+='~'
+    printf '%s' "$text"
+}
+
 # Host information is deliberately captured once, before the refresh loop.
 CPU_MODEL=$(awk -F ': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null)
 [[ -n "$CPU_MODEL" ]] || CPU_MODEL=$(uname -m)
@@ -270,17 +284,28 @@ declare -A GROUP_COUNT=() GROUP_CPU=() GROUP_CPU_LIMIT=() GROUP_CPU_UNCAPPED=()
 declare -A GROUP_CPU_MODE=()
 declare -A GROUP_MEM=() GROUP_MEM_LIMIT=() GROUP_MEM_UNCAPPED=()
 declare -A GROUP_STORAGE=() GROUP_STORAGE_UNKNOWN=()
+declare -A GROUP_IMAGE_STORAGE=() GROUP_IMAGE_APPROX=()
 declare -A ROW_TO_STACK=()
 declare -A MOUNT_SIZE_CACHE=() MOUNT_KNOWN_CACHE=() VOLUME_SIZE=()
+declare -A IMAGE_SIZE=() IMAGE_LAYERS=() LAYER_SIZE=()
 TOTAL_CPU=0 TOTAL_CPU_LIMIT=0 TOTAL_CPU_UNCAPPED=0
 TOTAL_MEM=0 TOTAL_MEM_LIMIT=0 TOTAL_MEM_UNCAPPED=0
 TOTAL_STORAGE=0 TOTAL_STORAGE_UNKNOWN=0
+TOTAL_IMAGE_STORAGE=0 TOTAL_IMAGE_APPROX=0
 SNAPSHOT_TIME='' LAST_ERROR='' STATUS_MESSAGE='Ready'
 SELECTED_INDEX=0 SCROLL_OFFSET=0 EXIT_REQUESTED=0 ACTION_REFRESH=0 UI_DIRTY=1
 NEXT_REFRESH=0
 ORIGINAL_STTY=''
 FRAME_FILE='' CAPTURE_FILE=''
 MOUNT_SCAN_INTERVAL=30 LAST_MOUNT_SCAN=-1
+IMAGE_SIGNATURE=''
+
+IFS='|' read -r DOCKER_STORAGE_DRIVER DOCKER_ROOT_DIR < <(
+    docker info --format '{{.Driver}}|{{.DockerRootDir}}' 2>/dev/null
+)
+DOCKER_STORAGE_DRIVER=${DOCKER_STORAGE_DRIVER:-}
+DOCKER_ROOT_DIR=${DOCKER_ROOT_DIR:-}
+
 
 clear_snapshot_data() {
     META=() STACKS=()
@@ -289,9 +314,11 @@ clear_snapshot_data() {
     GROUP_CPU_MODE=()
     GROUP_MEM=() GROUP_MEM_LIMIT=() GROUP_MEM_UNCAPPED=()
     GROUP_STORAGE=() GROUP_STORAGE_UNKNOWN=()
+    GROUP_IMAGE_STORAGE=() GROUP_IMAGE_APPROX=()
     TOTAL_CPU=0 TOTAL_CPU_LIMIT=0 TOTAL_CPU_UNCAPPED=0
     TOTAL_MEM=0 TOTAL_MEM_LIMIT=0 TOTAL_MEM_UNCAPPED=0
     TOTAL_STORAGE=0 TOTAL_STORAGE_UNKNOWN=0
+    TOTAL_IMAGE_STORAGE=0 TOTAL_IMAGE_APPROX=0
 }
 
 # Run a potentially slow command in the background while the foreground shell
@@ -346,6 +373,123 @@ refresh_mount_cache_if_due() {
     LAST_MOUNT_SCAN=$SECONDS
 }
 
+# Emit uncompressed layer diff IDs and their logical sizes from Docker's
+# storage-driver metadata. The directory is normally root-only, so callers
+# first try direct access and then non-interactive sudo. No prompt is shown.
+read_layerdb_sizes() {
+    local layerdb=$1 directory diff size
+    local -a directories=()
+    shopt -s nullglob
+    directories=("$layerdb"/*)
+    for directory in "${directories[@]}"; do
+        [[ -r "$directory/diff" && -r "$directory/size" ]] || continue
+        IFS= read -r diff < "$directory/diff"
+        IFS= read -r size < "$directory/size"
+        [[ -n "$diff" && "$size" =~ ^[0-9]+$ ]] && printf '%s|%s\n' "$diff" "$size"
+    done
+}
+
+# Cache image sizes and layer membership until the set of running images
+# changes. Exact layer-union totals are available when Docker's layerdb can be
+# read; otherwise distinct image sizes are used as a conservative upper bound.
+collect_image_metadata() {
+    local -a image_ids=("$@") layers=()
+    local signature inspect_output layer_output id size layer
+    local layerdb exact=1
+
+    signature=$(printf '%s\n' "${image_ids[@]}" | sort -u)
+    if [[ "$signature" == "$IMAGE_SIGNATURE" && ${#IMAGE_SIZE[@]} -gt 0 ]]; then
+        return 0
+    fi
+
+    IMAGE_SIZE=() IMAGE_LAYERS=() LAYER_SIZE=()
+    IMAGE_SIGNATURE=$signature
+    [[ -n "$signature" ]] || return 0
+
+    if ! capture_command inspect_output docker image inspect \
+        --format '{{.Id}}|{{.Size}}|{{range .RootFS.Layers}}{{printf "%s^" .}}{{end}}' \
+        "${image_ids[@]}"; then
+        inspect_output=''
+    fi
+    ((EXIT_REQUESTED)) && return 1
+    while IFS='|' read -r id size layer; do
+        [[ -n "$id" ]] || continue
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
+        IMAGE_SIZE["$id"]=$size
+        IMAGE_LAYERS["$id"]=$layer
+    done <<< "$inspect_output"
+
+    layerdb="$DOCKER_ROOT_DIR/image/$DOCKER_STORAGE_DRIVER/layerdb/sha256"
+    layer_output=''
+    if [[ -n "$DOCKER_ROOT_DIR" && -n "$DOCKER_STORAGE_DRIVER" ]]; then
+        capture_command layer_output read_layerdb_sizes "$layerdb" || layer_output=''
+        ((EXIT_REQUESTED)) && return 1
+        if [[ -z "$layer_output" ]] && command -v sudo >/dev/null 2>&1; then
+            capture_command layer_output sudo -n bash -c '
+                shopt -s nullglob
+                for directory in "$1"/*; do
+                    [[ -r "$directory/diff" && -r "$directory/size" ]] || continue
+                    IFS= read -r diff < "$directory/diff"
+                    IFS= read -r size < "$directory/size"
+                    [[ -n "$diff" && "$size" =~ ^[0-9]+$ ]] &&
+                        printf "%s|%s\n" "$diff" "$size"
+                done
+            ' _ "$layerdb" || layer_output=''
+            ((EXIT_REQUESTED)) && return 1
+        fi
+    fi
+    while IFS='|' read -r layer size; do
+        [[ -n "$layer" && "$size" =~ ^[0-9]+$ ]] || continue
+        LAYER_SIZE["$layer"]=$size
+    done <<< "$layer_output"
+
+    for id in "${image_ids[@]}"; do
+        IFS='^' read -ra layers <<< "${IMAGE_LAYERS["$id"]:-}"
+        for layer in "${layers[@]}"; do
+            [[ -z "$layer" || -n ${LAYER_SIZE["$layer"]+x} ]] || exact=0
+        done
+    done
+    ((exact)) || LAYER_SIZE=()
+    return 0
+}
+
+# Sets MEASURED_CONTAINER_BYTES, MEASURED_CONTAINER_UNKNOWN and
+# MEASURED_CONTAINER_KEYS. The Docker container directory contains its local
+# logs and metadata; the mounts subdirectory is excluded because it is runtime
+# state rather than disk storage.
+measure_container_metadata() {
+    local container_id=$1 log_path=$2 path key result size=0 known=0
+    MEASURED_CONTAINER_BYTES=0 MEASURED_CONTAINER_UNKNOWN=0 MEASURED_CONTAINER_KEYS=''
+    path="$DOCKER_ROOT_DIR/containers/$container_id"
+    key="container:$container_id"
+
+    if [[ -n ${MOUNT_KNOWN_CACHE["$key"]+x} ]]; then
+        size=${MOUNT_SIZE_CACHE["$key"]:-0}
+        known=${MOUNT_KNOWN_CACHE["$key"]}
+    elif [[ -n "$DOCKER_ROOT_DIR" ]] &&
+         capture_command result du -sb --exclude=mounts -- "$path"; then
+        size=${result%%[[:space:]]*}
+        [[ "$size" =~ ^[0-9]+$ ]] && known=1
+    elif [[ -n "$DOCKER_ROOT_DIR" ]] && command -v sudo >/dev/null 2>&1 &&
+         capture_command result sudo -n du -sb --exclude=mounts -- "$path"; then
+        size=${result%%[[:space:]]*}
+        [[ "$size" =~ ^[0-9]+$ ]] && known=1
+    elif [[ -n "$log_path" ]] && capture_command result du -sb -- "$log_path"; then
+        size=${result%%[[:space:]]*}
+    elif [[ -n "$log_path" ]] && command -v sudo >/dev/null 2>&1 &&
+         capture_command result sudo -n du -sb -- "$log_path"; then
+        size=${result%%[[:space:]]*}
+    fi
+    ((EXIT_REQUESTED)) && return 1
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    MOUNT_SIZE_CACHE["$key"]=$size
+    MOUNT_KNOWN_CACHE["$key"]=$known
+    MEASURED_CONTAINER_BYTES=$size
+    ((known)) || MEASURED_CONTAINER_UNKNOWN=1
+    MEASURED_CONTAINER_KEYS="$key~$size~$known^"
+    return 0
+}
+
 # Sets MEASURED_MOUNT_BYTES, MEASURED_MOUNT_UNKNOWN and MEASURED_MOUNT_KEYS.
 # Nested bind mounts are counted through their parent, and host Docker-control
 # mounts are excluded because they are not data owned by the container.
@@ -361,8 +505,9 @@ measure_container_mounts() {
         [[ -n "$entry" ]] || continue
         IFS='~' read -r type volume source destination <<< "$entry"
         [[ -n "$source" && -n "$destination" ]] || continue
-        if [[ "$source" == /var/run/docker.sock || "$source" == /var/lib/docker ||
-              "$source" == /var/lib/docker/* ]]; then
+        if [[ "$type" == bind &&
+              ( "$source" == /var/run/docker.sock || "$source" == /var/lib/docker ||
+                "$source" == /var/lib/docker/* ) ]]; then
             continue
         fi
 
@@ -416,11 +561,12 @@ measure_container_mounts() {
 }
 
 collect_snapshot() {
-    local -a ids raw_meta measured_meta
-    local -A next_cpu=() next_mem=()
+    local -a ids image_ids raw_meta measured_meta layers=()
+    local -A next_cpu=() next_mem=() image_id_seen=()
     local ps_output stats_output inspect_output
     local name cpu_raw mem_raw mem_used_raw
-    local full_id stack swarm_stack mem_limit rootfs storage nano quota period cpuset cpu_limit cpu_kind mounts
+    local full_id stack swarm_stack mem_limit rootfs rw storage nano quota period cpuset cpu_limit cpu_kind mounts
+    local image_id image_size log_path layer
     local line cpu_used mem_used mount_entry mount_key mount_size mount_known mount_unknown shared_limit
     local total_cpuset_specs=''
 
@@ -456,7 +602,7 @@ collect_snapshot() {
     fi
 
     if ! capture_command inspect_output docker inspect --size \
-        --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.stack.namespace"}}|{{.HostConfig.Memory}}|{{.SizeRootFs}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.CpuQuota}}|{{.HostConfig.CpuPeriod}}|{{.HostConfig.CpusetCpus}}|{{range .Mounts}}{{printf "%s~%s~%s~%s^" .Type (index . "Name") .Source .Destination}}{{end}}' \
+        --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.stack.namespace"}}|{{.HostConfig.Memory}}|{{.SizeRw}}|{{.SizeRootFs}}|{{.Image}}|{{.LogPath}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.CpuQuota}}|{{.HostConfig.CpuPeriod}}|{{.HostConfig.CpusetCpus}}|{{range .Mounts}}{{printf "%s~%s~%s~%s^" .Type (index . "Name") .Source .Destination}}{{end}}' \
         "${ids[@]}"; then
         ((EXIT_REQUESTED)) && return 1
         LAST_ERROR="Docker inspect failed: $inspect_output"
@@ -478,29 +624,40 @@ collect_snapshot() {
         next_mem["$name"]=$(to_bytes "$mem_used_raw")
     done <<< "$stats_output"
 
+    while IFS='|' read -r _ _ _ _ _ _ _ image_id _ _ _ _ _ _; do
+        [[ -n "$image_id" && -z ${image_id_seen["$image_id"]+x} ]] || continue
+        image_id_seen["$image_id"]=1
+        image_ids+=("$image_id")
+    done <<< "$inspect_output"
+    collect_image_metadata "${image_ids[@]}" || return 1
+
     mapfile -t raw_meta < <(
-        while IFS='|' read -r full_id name stack swarm_stack mem_limit rootfs nano quota period cpuset mounts; do
+        while IFS='|' read -r full_id name stack swarm_stack mem_limit rw rootfs image_id log_path nano quota period cpuset mounts; do
             [[ -n "$full_id" ]] || continue
             name=${name#/}
             if [[ -z "$stack" || "$stack" == '<no value>' ]]; then stack=$swarm_stack; fi
             [[ -n "$stack" && "$stack" != '<no value>' ]] || stack='(standalone)'
             [[ "$mem_limit" =~ ^[0-9]+$ ]] || mem_limit=0
+            [[ "$rw" =~ ^[0-9]+$ ]] || rw=0
             [[ "$rootfs" =~ ^[0-9]+$ ]] || rootfs=0
             cpu_limit=$(cpu_limit_hundredths "$nano" "$quota" "$period" "$cpuset")
             cpu_kind=$(cpu_limit_kind "$nano" "$quota" "$period" "$cpuset")
-            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-                "$stack" "$name" "$full_id" "$mem_limit" "$rootfs" "$cpu_limit" \
-                "$cpu_kind" "$cpuset" "$mounts"
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+                "$stack" "$name" "$full_id" "$mem_limit" "$rw" "$rootfs" \
+                "$cpu_limit" "$cpu_kind" "$cpuset" "$mounts" "$image_id" "$log_path"
         done <<< "$inspect_output" | sort -t '|' -k1,1 -k2,2
     )
 
     refresh_mount_cache_if_due || return 1
     measured_meta=()
     for line in "${raw_meta[@]}"; do
-        IFS='|' read -r stack name full_id mem_limit rootfs cpu_limit cpu_kind cpuset mounts <<< "$line"
+        IFS='|' read -r stack name full_id mem_limit rw rootfs cpu_limit cpu_kind cpuset mounts image_id log_path <<< "$line"
         measure_container_mounts "$name" "$mounts" || return 1
-        storage=$((rootfs + MEASURED_MOUNT_BYTES))
-        measured_meta+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$MEASURED_MOUNT_UNKNOWN|$rootfs|$cpu_kind|$cpuset|$MEASURED_MOUNT_KEYS")
+        measure_container_metadata "$full_id" "$log_path" || return 1
+        storage=$((rw + MEASURED_MOUNT_BYTES + MEASURED_CONTAINER_BYTES))
+        image_size=${IMAGE_SIZE["$image_id"]:-$((rootfs - rw))}
+        ((image_size >= 0)) || image_size=0
+        measured_meta+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$((MEASURED_MOUNT_UNKNOWN + MEASURED_CONTAINER_UNKNOWN))|$rw|$cpu_kind|$cpuset|$MEASURED_MOUNT_KEYS$MEASURED_CONTAINER_KEYS|$image_id|$image_size")
     done
 
     # Commit only after every slow command has completed. Until this point the
@@ -512,10 +669,12 @@ collect_snapshot() {
     done
 
     declare -A seen=() group_mount_seen=() total_mount_seen=()
+    declare -A group_image_seen=() total_image_seen=()
+    declare -A group_layer_seen=() total_layer_seen=()
     declare -A group_cpuset_specs=() group_has_quota=()
     for line in "${measured_meta[@]}"; do
-        IFS='|' read -r stack name full_id mem_limit storage cpu_limit mount_unknown rootfs cpu_kind cpuset mounts <<< "$line"
-        META+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$mount_unknown|$cpu_kind|$cpuset")
+        IFS='|' read -r stack name full_id mem_limit storage cpu_limit mount_unknown rw cpu_kind cpuset mounts image_id image_size <<< "$line"
+        META+=("$stack|$name|$full_id|$mem_limit|$storage|$cpu_limit|$mount_unknown|$cpu_kind|$cpuset|$image_size")
         cpu_used=${STAT_CPU["$name"]:-0}
         mem_used=${STAT_MEM["$name"]:-0}
         if [[ -z ${seen["$stack"]+x} ]]; then
@@ -526,10 +685,10 @@ collect_snapshot() {
         GROUP_COUNT["$stack"]=$(( ${GROUP_COUNT["$stack"]:-0} + 1 ))
         GROUP_CPU["$stack"]=$(( ${GROUP_CPU["$stack"]:-0} + cpu_used ))
         GROUP_MEM["$stack"]=$(( ${GROUP_MEM["$stack"]:-0} + mem_used ))
-        GROUP_STORAGE["$stack"]=$(( ${GROUP_STORAGE["$stack"]:-0} + rootfs ))
+        GROUP_STORAGE["$stack"]=$(( ${GROUP_STORAGE["$stack"]:-0} + rw ))
         TOTAL_CPU=$((TOTAL_CPU + cpu_used))
         TOTAL_MEM=$((TOTAL_MEM + mem_used))
-        TOTAL_STORAGE=$((TOTAL_STORAGE + rootfs))
+        TOTAL_STORAGE=$((TOTAL_STORAGE + rw))
 
         IFS='^' read -ra mount_entries <<< "$mounts"
         for mount_entry in "${mount_entries[@]}"; do
@@ -546,6 +705,32 @@ collect_snapshot() {
                 ((mount_known)) || TOTAL_STORAGE_UNKNOWN=$((TOTAL_STORAGE_UNKNOWN + 1))
             fi
         done
+
+        if ((${#LAYER_SIZE[@]} > 0)); then
+            IFS='^' read -ra layers <<< "${IMAGE_LAYERS["$image_id"]:-}"
+            for layer in "${layers[@]}"; do
+                [[ -n "$layer" ]] || continue
+                if [[ -z ${group_layer_seen["$stack::$layer"]+x} ]]; then
+                    group_layer_seen["$stack::$layer"]=1
+                    GROUP_IMAGE_STORAGE["$stack"]=$(( ${GROUP_IMAGE_STORAGE["$stack"]:-0} + ${LAYER_SIZE["$layer"]:-0} ))
+                fi
+                if [[ -z ${total_layer_seen["$layer"]+x} ]]; then
+                    total_layer_seen["$layer"]=1
+                    TOTAL_IMAGE_STORAGE=$((TOTAL_IMAGE_STORAGE + ${LAYER_SIZE["$layer"]:-0}))
+                fi
+            done
+        else
+            if [[ -z ${group_image_seen["$stack::$image_id"]+x} ]]; then
+                group_image_seen["$stack::$image_id"]=1
+                GROUP_IMAGE_STORAGE["$stack"]=$(( ${GROUP_IMAGE_STORAGE["$stack"]:-0} + image_size ))
+            fi
+            if [[ -z ${total_image_seen["$image_id"]+x} ]]; then
+                total_image_seen["$image_id"]=1
+                TOTAL_IMAGE_STORAGE=$((TOTAL_IMAGE_STORAGE + image_size))
+            fi
+            GROUP_IMAGE_APPROX["$stack"]=1
+            TOTAL_IMAGE_APPROX=1
+        fi
 
         case "$cpu_kind" in
             cpuset)
@@ -607,20 +792,21 @@ terminal_size() {
 }
 
 set_column_widths() {
-    if ((TERM_COLS >= 105)); then
-        NAME_W=34 CPU_W=21 MEM_W=25 STORAGE_W=14
-    elif ((TERM_COLS >= 90)); then
-        CPU_W=20 MEM_W=22 STORAGE_W=12
-        NAME_W=$((TERM_COLS - CPU_W - MEM_W - STORAGE_W - 10))
+    if ((TERM_COLS >= 140)); then
+        NAME_W=34 CPU_W=21 MEM_W=21 STORAGE_W=12 IMAGE_W=12 TOTAL_W=12
+    elif ((TERM_COLS >= 120)); then
+        CPU_W=17 MEM_W=18 STORAGE_W=11 IMAGE_W=11 TOTAL_W=11
+        NAME_W=$((TERM_COLS - CPU_W - MEM_W - STORAGE_W - IMAGE_W - TOTAL_W - 15))
     else
-        CPU_W=18 MEM_W=19 STORAGE_W=10
-        NAME_W=$((TERM_COLS - CPU_W - MEM_W - STORAGE_W - 10))
+        CPU_W=15 MEM_W=16 STORAGE_W=10 IMAGE_W=10 TOTAL_W=10
+        NAME_W=$((TERM_COLS - CPU_W - MEM_W - STORAGE_W - IMAGE_W - TOTAL_W - 15))
     fi
 }
 
 print_table_row() {
-    local first=$1 cpu=$2 memory=$3 storage=$4
-    local first_color=${5:-} cpu_color=${6:-} mem_color=${7:-} storage_color=${8:-}
+    local first=$1 cpu=$2 memory=$3 storage=$4 images=$5 total=$6
+    local first_color=${7:-} cpu_color=${8:-} mem_color=${9:-}
+    local storage_color=${10:-} image_color=${11:-} total_color=${12:-}
     print_cell "$first" "$NAME_W" left "$first_color"
     printf ' | '
     print_cell "$cpu" "$CPU_W" right "$cpu_color"
@@ -628,21 +814,26 @@ print_table_row() {
     print_cell "$memory" "$MEM_W" left "$mem_color"
     printf ' | '
     print_cell "$storage" "$STORAGE_W" right "$storage_color"
-    printf '\n'
+    printf ' | '
+    print_cell "$images" "$IMAGE_W" right "$image_color"
+    printf ' | '
+    print_cell "$total" "$TOTAL_W" right "$total_color"
+    printf '
+'
 }
 
 build_dashboard() {
     local -a row_types=() row_stacks=() row_names=()
-    local line stack name full_id mem_limit storage storage_unknown cpu_limit cpu_used mem_used cpu_kind cpuset
+    local line stack name full_id mem_limit storage storage_unknown image_size cpu_limit cpu_used mem_used cpu_kind cpuset
     local cpu_limit_display mem_limit_display cpu_display mem_display cpu_mode
     local cpu_color mem_color first label i j selected_line=0
     local viewport content_count screen_row footer overall
 
     terminal_size
     ROW_TO_STACK=()
-    if ((TERM_ROWS < 12 || TERM_COLS < 76)); then
+    if ((TERM_ROWS < 12 || TERM_COLS < 105)); then
         printf '%bDocker Resource Monitor%b\n' "$BOLD$CYAN" "$RESET"
-        printf 'Terminal is too small: %sx%s. Minimum: 76 columns x 12 rows.\n' \
+        printf 'Terminal is too small: %sx%s. Minimum: 105 columns x 12 rows.\n' \
             "$TERM_COLS" "$TERM_ROWS"
         printf 'Resize the SSH terminal, or press q to quit.'
         UI_DIRTY=0
@@ -654,11 +845,11 @@ build_dashboard() {
         "$BOLD$CYAN" "$RESET" "$(hostname)" "$INTERVAL" "${SNAPSHOT_TIME:---:--:--}"
     printf '%s\n' "$(clip "$HOST_CPU_TEXT" "$((TERM_COLS - 1))")"
     printf '%s\n' "$(clip "$HOST_CAPACITY_TEXT" "$((TERM_COLS - 1))")"
-    overall="Running ${#META[@]} | CPU $(human_pct "$TOTAL_CPU") | RAM $(human_bytes "$TOTAL_MEM") | Storage $(storage_text "$TOTAL_STORAGE" "$TOTAL_STORAGE_UNKNOWN")"
+    overall="Running ${#META[@]} | CPU $(human_pct "$TOTAL_CPU") | RAM $(human_bytes "$TOTAL_MEM") | Data $(storage_text "$TOTAL_STORAGE" "$TOTAL_STORAGE_UNKNOWN") | Images $(image_storage_text "$TOTAL_IMAGE_STORAGE" "$TOTAL_IMAGE_APPROX") | Total $(total_storage_text "$((TOTAL_STORAGE + TOTAL_IMAGE_STORAGE))" "$TOTAL_STORAGE_UNKNOWN" "$TOTAL_IMAGE_APPROX")"
     printf '%b%s%b\n' "$BOLD" "$(clip "$overall" "$((TERM_COLS - 1))")" "$RESET"
     printf '%s\n' "$(clip 'Keys: arrows select/collapse | Enter/mouse toggle | +/- or 1..9 interval | 0/d default 5s | c/e all | r refresh | q quit' "$((TERM_COLS - 1))")"
     printf '%b' "$BOLD"
-    print_table_row 'STACK / CONTAINER' 'CPU USED / LIMIT' 'MEMORY USED / LIMIT' 'STORAGE USED*'
+    print_table_row 'STACK / CONTAINER' 'CPU USED / LIMIT' 'MEMORY USED / LIMIT' 'DATA USED*' 'IMAGE USED' 'TOTAL USED'
     printf '%b' "$RESET$DIM"
     printf '%s\n' "$(clip '---------------------------------------------------------------------------------------------------------------' "$((TERM_COLS - 1))")"
     printf '%b' "$RESET"
@@ -669,7 +860,7 @@ build_dashboard() {
         row_names+=('')
         if ((${COLLAPSED["$stack"]:-0} == 0)); then
             for line in "${META[@]}"; do
-                IFS='|' read -r first name full_id mem_limit storage cpu_limit storage_unknown cpu_kind cpuset <<< "$line"
+                IFS='|' read -r first name full_id mem_limit storage cpu_limit storage_unknown cpu_kind cpuset image_size <<< "$line"
                 [[ "$first" == "$stack" ]] || continue
                 row_types+=(container)
                 row_stacks+=("$stack")
@@ -730,20 +921,24 @@ build_dashboard() {
                 first="$first $label $stack (${GROUP_COUNT["$stack"]})"
                 print_table_row "$first" "$cpu_display" "$mem_display" \
                     "$(storage_text "${GROUP_STORAGE["$stack"]}" "${GROUP_STORAGE_UNKNOWN["$stack"]:-0}")" \
-                    "$BOLD$MAGENTA" "$cpu_color" "$mem_color" "$CYAN"
+                    "$(image_storage_text "${GROUP_IMAGE_STORAGE["$stack"]:-0}" "${GROUP_IMAGE_APPROX["$stack"]:-0}")" \
+                    "$(total_storage_text "$(( ${GROUP_STORAGE["$stack"]:-0} + ${GROUP_IMAGE_STORAGE["$stack"]:-0} ))" "${GROUP_STORAGE_UNKNOWN["$stack"]:-0}" "${GROUP_IMAGE_APPROX["$stack"]:-0}")" \
+                    "$BOLD$MAGENTA" "$cpu_color" "$mem_color" "$CYAN" "$MAGENTA" "$BOLD$CYAN"
                 ;;
             container)
                 name=${row_names[$i]}
                 for line in "${META[@]}"; do
-                    IFS='|' read -r first stack full_id mem_limit storage cpu_limit storage_unknown cpu_kind cpuset <<< "$line"
+                    IFS='|' read -r first stack full_id mem_limit storage cpu_limit storage_unknown cpu_kind cpuset image_size <<< "$line"
                     [[ "$stack" == "$name" ]] && break
                 done
                 cpu_used=${STAT_CPU["$name"]:-0}
                 mem_used=${STAT_MEM["$name"]:-0}
                 print_table_row "    $name" "$(cpu_text "$cpu_used" "$cpu_limit" "$cpu_kind")" \
                     "$(memory_text "$mem_used" "$mem_limit")" "$(storage_text "$storage" "$storage_unknown")" \
+                    "$(image_storage_text "$image_size" 0)" \
+                    "$(total_storage_text "$((storage + image_size))" "$storage_unknown" 0)" \
                     '' "$(resource_color "$cpu_used" "$cpu_limit")" \
-                    "$(resource_color "$mem_used" "$mem_limit")" "$CYAN"
+                    "$(resource_color "$mem_used" "$mem_limit")" "$CYAN" "$MAGENTA" "$CYAN"
                 ;;
         esac
     done
@@ -768,35 +963,44 @@ render_dashboard() {
 }
 
 render_full_report() {
-    local line stack name full_id mem_limit storage storage_unknown cpu_limit cpu_used mem_used cpu_kind cpuset
+    local line stack name full_id mem_limit storage storage_unknown image_size cpu_limit cpu_used mem_used cpu_kind cpuset
     local cpu_limit_display cpu_mode
     printf '%bDocker Resource Monitor%b | %s | snapshot %s\n' "$BOLD$CYAN" "$RESET" "$(hostname)" "$SNAPSHOT_TIME"
     printf '%s\n%s\n' "$HOST_CPU_TEXT" "$HOST_CAPACITY_TEXT"
-    printf 'Running: %d | CPU: %s | RAM: %s | Container storage: %s\n\n' \
-        "${#META[@]}" "$(human_pct "$TOTAL_CPU")" "$(human_bytes "$TOTAL_MEM")" "$(storage_text "$TOTAL_STORAGE" "$TOTAL_STORAGE_UNKNOWN")"
-    printf '%-34s | %21s | %-25s | %14s\n' 'STACK / CONTAINER' 'CPU USED / LIMIT' 'MEMORY USED / LIMIT' 'STORAGE USED*'
-    printf '%s\n' '-----------------------------------+-----------------------+---------------------------+----------------'
+    printf 'Running: %d | CPU: %s | RAM: %s | Data: %s | Images: %s | Total: %s\n\n' \
+        "${#META[@]}" "$(human_pct "$TOTAL_CPU")" "$(human_bytes "$TOTAL_MEM")" \
+        "$(storage_text "$TOTAL_STORAGE" "$TOTAL_STORAGE_UNKNOWN")" \
+        "$(image_storage_text "$TOTAL_IMAGE_STORAGE" "$TOTAL_IMAGE_APPROX")" \
+        "$(total_storage_text "$((TOTAL_STORAGE + TOTAL_IMAGE_STORAGE))" "$TOTAL_STORAGE_UNKNOWN" "$TOTAL_IMAGE_APPROX")"
+    printf '%-34s | %21s | %-21s | %12s | %12s | %12s\n' \
+        'STACK / CONTAINER' 'CPU USED / LIMIT' 'MEMORY USED / LIMIT' 'DATA USED*' 'IMAGE USED' 'TOTAL USED'
+    printf '%s\n' '-----------------------------------+-----------------------+-----------------------+--------------+--------------+--------------'
     stack=''
     for line in "${META[@]}"; do
-        IFS='|' read -r full_id name _ mem_limit storage cpu_limit storage_unknown cpu_kind cpuset <<< "$line"
+        IFS='|' read -r full_id name _ mem_limit storage cpu_limit storage_unknown cpu_kind cpuset image_size <<< "$line"
         if [[ "$full_id" != "$stack" ]]; then
             stack=$full_id
             cpu_limit_display=${GROUP_CPU_LIMIT["$stack"]:-0}
             ((${GROUP_CPU_UNCAPPED["$stack"]:-0})) && cpu_limit_display=0
             cpu_mode=${GROUP_CPU_MODE["$stack"]:-percent}
-            printf '[stack: %s] CPU %s | RAM %s | Storage %s\n' "$stack" \
+            printf '[stack: %s] CPU %s | RAM %s | Data %s | Images %s | Total %s\n' "$stack" \
                 "$(cpu_text "${GROUP_CPU["$stack"]}" "$cpu_limit_display" "$cpu_mode")" \
                 "$(human_bytes "${GROUP_MEM["$stack"]}")" \
-                "$(storage_text "${GROUP_STORAGE["$stack"]}" "${GROUP_STORAGE_UNKNOWN["$stack"]:-0}")"
+                "$(storage_text "${GROUP_STORAGE["$stack"]}" "${GROUP_STORAGE_UNKNOWN["$stack"]:-0}")" \
+                "$(image_storage_text "${GROUP_IMAGE_STORAGE["$stack"]:-0}" "${GROUP_IMAGE_APPROX["$stack"]:-0}")" \
+                "$(total_storage_text "$(( ${GROUP_STORAGE["$stack"]:-0} + ${GROUP_IMAGE_STORAGE["$stack"]:-0} ))" "${GROUP_STORAGE_UNKNOWN["$stack"]:-0}" "${GROUP_IMAGE_APPROX["$stack"]:-0}")"
         fi
         cpu_used=${STAT_CPU["$name"]:-0}
         mem_used=${STAT_MEM["$name"]:-0}
-        printf '  %-32s | %21s | %-25s | %14s\n' "$name" \
+        printf '  %-32s | %21s | %-21s | %12s | %12s | %12s\n' "$name" \
             "$(cpu_text "$cpu_used" "$cpu_limit" "$cpu_kind")" "$(memory_text "$mem_used" "$mem_limit")" \
-            "$(storage_text "$storage" "$storage_unknown")"
+            "$(storage_text "$storage" "$storage_unknown")" "$(image_storage_text "$image_size" 0)" \
+            "$(total_storage_text "$((storage + image_size))" "$storage_unknown" 0)"
     done
-    printf '\n* Storage = root filesystem plus mounted local data. Shared mounts are deduplicated in stack/host totals.\n'
-    printf '  A trailing + means at least one mount could not be measured. Remote backups are not local storage.\n'
+    printf '\n* Data = writable layer + Docker logs/metadata + mounted local data. Shared paths are deduplicated in stack/host totals.\n'
+    printf '  Image layers are deduplicated in stack/host totals. ~ means distinct-image upper bound (layer metadata unavailable).\n'
+    printf '  Total = Data + Images, preserving + and ~ uncertainty markers.\n'
+    printf '  A trailing + means at least one local path could not be measured. Remote backups are not local storage.\n'
 }
 
 selected_stack() {

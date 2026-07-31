@@ -8,8 +8,8 @@ The dashboard is designed for local terminals and SSH sessions. It uses a bounde
 
 - CPU usage and configured CPU limits
 - Memory usage and configured memory limits
-- Local storage used by container root filesystems, bind mounts, and Docker volumes
-- Per-stack CPU, memory, storage, and container totals
+- Separate data, Docker-image, and total-storage columns, including container metadata, logs, and writable layers
+- Per-stack CPU, memory, data, deduplicated image storage, and container totals
 - Overall totals across all running containers
 - Docker Compose and Docker Swarm stack detection
 - Collapsible stack groups with keyboard and mouse controls
@@ -27,7 +27,7 @@ Only running containers are displayed.
 - Docker Engine and the Docker CLI
 - Permission to access the Docker daemon
 - Standard Linux utilities: `awk`, `df`, `du`, `nproc`, `sort`, `stty`, and `mktemp`
-- For interactive mode: an ANSI-compatible terminal at least 76 columns by 12 rows
+- For interactive mode: an ANSI-compatible terminal at least 105 columns by 12 rows
 
 Confirm that Docker is available to your user:
 
@@ -160,25 +160,36 @@ Colors apply to CPU and memory when a meaningful limit is available.
 
 ### Storage
 
-Per-container storage includes:
+Storage is split into two columns so image layers are not mixed into every container's local-data total.
 
-- The logical container root filesystem, including its image and writable layer
+`DATA USED` includes:
+
+- The container's writable layer (`SizeRw`), without the read-only image
+- Its Docker-managed logs and per-container metadata
 - Local bind-mounted files and directories
 - Docker volume data reported by the Docker daemon
 
-Nested bind mounts are deduplicated within a container. Shared mount sources are also deduplicated in stack and overall totals. Image layers remain logical per-container values and may be represented in more than one container total.
+Nested bind mounts are deduplicated within a container. Shared mount and container-metadata paths are deduplicated in stack and overall totals. Container rows still show all data visible to that container, so adding expanded container rows manually can repeat shared mounts; use the stack row for its deduplicated total.
 
-Mounted-storage measurements are cached for 30 seconds to avoid repeatedly scanning large directories. Press `r` to force an immediate storage rescan.
+`IMAGE USED` shows the full logical image size on container rows. Stack and overall rows count each associated image layer once, including when several containers use the same image or different images share a base layer. Only images used by running containers are included.
 
-A trailing `+` means at least one mount could not be measured, so the displayed value is a known minimum:
+Docker's layer-size metadata is commonly root-only. The monitor tries direct access and then non-interactive `sudo -n`; it never opens a password prompt. If neither works or the storage driver does not expose layer metadata, stack and overall image values fall back to the sum of distinct image sizes. A trailing `~` marks this conservative upper bound because layers shared between different images may still be repeated.
+
+`TOTAL USED` is `DATA USED + IMAGES USED`. On stack and overall rows, both sides are already deduplicated, so this is the monitor's best total for storage associated with the running containers. A `+` or `~` marker is carried into the total when part of the measurement is incomplete or an upper bound.
+
+Mounted-data and container-metadata measurements are cached for 30 seconds to avoid repeatedly scanning large paths. Press `r` to force an immediate data rescan. Image metadata is refreshed when the running image set changes.
+
+A trailing `+` in the data column means at least one local path could not be measured, so the displayed value is a known minimum:
 
 ```text
 12.9 GiB+
 ```
 
-The script first measures bind mounts from the host. If permissions prevent that, it attempts a read-only `du` through `docker exec -u 0` inside the running container. Minimal container images without `du`, inaccessible mounts, or unusual storage drivers may produce a trailing `+`.
+The script first measures bind mounts from the host. If permissions prevent that, it attempts a read-only `du` through `docker exec -u 0` inside the running container. Docker logs and metadata are measured from each container directory directly or through non-interactive sudo. Minimal container images without `du`, inaccessible mounts or container metadata, and unusual logging drivers may produce a trailing `+` or omit storage that Docker cannot attribute to a container.
 
-Docker control mounts such as `/var/run/docker.sock` and `/var/lib/docker` are excluded because they represent host-wide Docker state rather than data owned by one container. Remote files uploaded to cloud, FTP, SMB, or other external storage are not local container usage and cannot be included.
+Docker named volumes are supported in addition to bind mounts. Their sizes come from `docker system df -v`; writable layers and Docker container metadata are counted even when a container has no bind mounts. `tmpfs` mounts are memory-backed and are not disk storage.
+
+Bind mounts of Docker control paths such as `/var/run/docker.sock` and `/var/lib/docker` are excluded because they represent host-wide Docker state rather than data owned by one container. Remote files uploaded to cloud, FTP, SMB, or other external storage are not local container usage and cannot be included.
 
 ## Stack grouping
 
@@ -189,7 +200,7 @@ The monitor checks these Docker labels in order:
 
 Containers without either label are placed in the `(standalone)` group.
 
-Stack storage totals deduplicate shared local mount sources so, for example, the same website directory mounted by both an application and its backup container is not counted twice in that stack's total.
+Stack data totals deduplicate shared local mount and container-metadata paths. Stack image totals independently deduplicate image layers, so repeated images and shared base layers are counted once.
 
 ## Refresh behavior
 
@@ -197,7 +208,7 @@ The default refresh interval is five seconds. Keyboard and mouse actions are han
 
 At a one-second setting, Docker's own statistics sampling and filesystem measurement time may make the effective interval longer than exactly one second on busy hosts.
 
-Host CPU, core count, total RAM, and root-disk information are collected once at startup. CPU and memory container statistics update each refresh. Mounted-storage sizes are refreshed every 30 seconds or when `r` is pressed.
+Host CPU, core count, total RAM, and root-disk information are collected once at startup. CPU and memory container statistics update each refresh. Mounted-data and Docker container-metadata sizes are refreshed every 30 seconds or when `r` is pressed. Image metadata is refreshed when the running image set changes.
 
 ## Troubleshooting
 
